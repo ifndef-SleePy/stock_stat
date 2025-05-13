@@ -2,6 +2,7 @@ package com.github.ifndefsleepy.streaming;
 
 import org.apache.flink.api.common.RuntimeExecutionMode;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.table.api.StatementSet;
 import org.apache.flink.table.api.TableResult;
 import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
 
@@ -77,7 +78,8 @@ public class RollingXMinTopNWeight {
                 "            ELSE 0\n" +
                 "        END\n" +
                 "    ) AS total_volume,\n" +
-                "    TO_TIMESTAMP(MAX(ts), 'yyyy-MM-dd HH:mm:ss') AS ts\n" +
+                "    TO_TIMESTAMP(MAX(ts), 'yyyy-MM-dd HH:mm:ss') AS ts,\n" +
+                "    WATERMARK FOR ts AS ts - INTERVAL '5' SECOND\n" +
                 "FROM (\n" +
                 "    SELECT accountId, instrumentId, 'Long' AS direction, volume, DATE_FORMAT(FLOOR(CURRENT_TIMESTAMP TO DAY) + INTERVAL '9' HOUR + INTERVAL '30' MINUTE, 'yyyy-MM-dd HH:mm:ss') AS ts \n" +
                 "    FROM stock_holding\n" +
@@ -92,7 +94,8 @@ public class RollingXMinTopNWeight {
                 "SELECT \n" +
                 "    h.accountId,\n" +
                 "    h.instrumentId,\n" +
-                "    h.total_volume * p.lastPrice AS holding_value\n" +
+                "    h.total_volume * p.lastPrice AS holding_value," +
+                "    h.ts\n" +
                 "FROM current_holdings h\n" +
                 "LEFT JOIN price FOR SYSTEM_TIME AS OF h.ts p\n" +
                 "ON h.instrumentId = p.instrumentId";
@@ -101,10 +104,9 @@ public class RollingXMinTopNWeight {
                 "CREATE TEMPORARY VIEW minute_snapshots AS\n" +
                 "SELECT\n" +
                 "    accountId,\n" +
-                "    window_end AS snapshot_time,\n" +
                 "    instrumentId,\n" +
-                "    LAST_VALUE(holding_value) AS holding_value_snapshot,\n" +
-                "    SUM(holding_value) AS total_value\n" +
+                "    window_end AS snapshot_time,\n" +
+                "    LAST_VALUE(holding_value) AS holding_value_snapshot\n" +
                 "FROM TABLE(\n" +
                 "    CUMULATE(\n" +
                 "        TABLE holding_values,\n" +
@@ -112,70 +114,153 @@ public class RollingXMinTopNWeight {
                 "        INTERVAL '1' MINUTE,\n" +
                 "        INTERVAL '1' DAY\n" +
                 "    ))\n" +
-                "GROUP BY accountId";
+                "GROUP BY accountId, instrumentId, window_end";
 
-        String top10WeightSql = "" +
-                "CREATE TEMPORARY VIEW top_10_weights AS\n" +
+        String top10MinuteSnapshotSql = "" +
+                "CREATE TEMPORARY VIEW top10_instrument AS\n" +
                 "SELECT\n" +
                 "    accountId,\n" +
-                "    window_end AS ts,\n" +
-                "    AVG(holding_weight) AS rolling60minTop10Weight,\n" +
-                "    AVG(total_value) AS rollingXMinMarketValue\n" +
+                "    instrumentId,\n" +
+                "    window_end AS snapshot_time,\n" +
+                "    holding_value_snapshot\n" +
                 "FROM (\n" +
                 "    SELECT\n" +
                 "        accountId,\n" +
+                "        instrumentId,\n" +
                 "        window_end,\n" +
-                "        snapshot_time,\n" +
-                "        (holding_value_snapshot / total_value) AS holding_weight,\n" +
-                "        LAST_VALUE(total_value) AS total_value\n" +
-                "    FROM (\n" +
-                "        SELECT *,\n" +
-                "            ROW_NUMBER() OVER (\n" +
-                "                PARTITION BY accountId, snapshot_time, snapshotTime\n" +
-                "                ORDER BY (holding_value_snapshot / total_value) DESC\n" +
-                "            ) AS rank\n" +
-                "        FROM TABLE(\n" +
-                "            HOP(\n" +
-                "                TABLE minute_snapshots,\n" +
-                "                DESCRIPTOR(snapshot_time),\n" +
-                "                INTERVAL '1' MINUTE,\n" +
-                "                INTERVAL '60' MINUTES\n" +
-                "            )\n" +
+                "        holding_value_snapshot,\n" +
+                "        ROW_NUMBER() OVER (\n" +
+                "            PARTITION BY accountId, snapshot_time\n" +
+                "            ORDER BY holding_value_snapshot DESC\n" +
+                "        ) AS rank_num\n" +
+                "    FROM TABLE (\n" +
+                "        TUMBLE (\n" +
+                "            TABLE minute_snapshots,\n" +
+                "            DESCRIPTOR(snapshot_time),\n" +
+                "            INTERVAL '1' MINUTE\n" +
                 "        )\n" +
                 "    )\n" +
-                "    WHERE rank <= 10\n" +
-                "    GROUP BY accountId, window_end, snapshotTime\n" +
                 ")\n" +
-                "GROUP BY accountId, snapshot_time;";
+                "WHERE rank_num <= 10";
 
-        String printTableSql = "" +
-                "CREATE TABLE print (\n" +
-                "   accountId STRING,\n" +
+        String marketValueSql = "" +
+                "CREATE TEMPORARY VIEW market_value AS\n" +
+                "SELECT\n" +
+                "    accountId,\n" +
+                "    window_end AS snapshot_time,\n" +
+                "    SUM(holding_value_snapshot) AS market_value\n" +
+                "FROM TABLE(\n" +
+                "    TUMBLE(\n" +
+                "        TABLE minute_snapshots,\n" +
+                "        DESCRIPTOR(snapshot_time),\n" +
+                "        INTERVAL '1' MINUTE\n" +
+                "    ))\n" +
+                "GROUP BY accountId, window_end";
+
+        String top10WeightSql = "" +
+                "CREATE TEMPORARY VIEW top_10_weight AS\n" +
+                "SELECT\n" +
+                "    t.accountId,\n" +
+                "    t.instrumentId,\n" +
+                "    t.snapshot_time AS snapshot_time,\n" +
+                "    SUM(t.holding_value_snapshot) / m.market_value AS Top10Weight\n" +
+                "FROM top10_instrument t\n" +
+                "INNER JOIN market_value m \n" +
+                "    ON t.accountId = m.accountId\n" +
+                "    AND t.snapshot_time BETWEEN m.snapshot_time - INTERVAL '1' SECOND \n" +
+                "                            AND m.snapshot_time + INTERVAL '1' SECOND\n" +
+                "GROUP BY t.accountId, t.instrumentId, t.snapshot_time, m.market_value";
+
+        String rolling60MinTop10WeightSql = "" +
+                "CREATE TEMPORARY VIEW rolling_60_min_top_10_weight AS\n" +
+                "SELECT\n" +
+                "    accountId,\n" +
+                "    window_end AS ts,\n" +
+                "    AVG(Top10Weight) AS rolling60MinTop10Weight\n" +
+                "FROM TABLE (\n" +
+                "    TUMBLE (\n" +
+                "        TABLE top_10_weight,\n" +
+                "        DESCRIPTOR(snapshot_time),\n" +
+                "        INTERVAL '60' MINUTES\n" +
+                "    ))\n" +
+                "GROUP BY accountId, window_end";
+
+        String rolling60MinMarketValueSql = "" +
+                "CREATE TEMPORARY VIEW rolling_60_min_market_value AS\n" +
+                "SELECT \n" +
+                "    accountId,\n" +
+                "    window_end AS ts,\n" +
+                "    SUM(market_value) AS rolling60MinMarketValue \n" +
+                "FROM TABLE(\n" +
+                "    TUMBLE(\n" +
+                "        TABLE market_value,\n" +
+                "        DESCRIPTOR(snapshot_time),\n" +
+                "        INTERVAL '60' MINUTES\n" +
+                "    ))\n" +
+                "GROUP BY accountId, window_end";
+
+        String rolling60MinTop10WeightPrintTable = "" +
+                "CREATE TABLE rolling_60_min_top_10_weight_print (\n" +
+                "   accountId INT,\n" +
                 "   ts TIMESTAMP,\n" +
-                "   rolling60minTop10Weight DOUBLE,\n" +
-                "   rollingXMinMarketValue DOUBLE\n" +
+                "   rolling60MinTop10Weight DOUBLE\n" +
                 ") WITH ('connector' = 'print')";
 
-        String executeSql = "" +
-                "INSERT INTO print\n" +
-                "SELECT\n" +
-                "   t.accountId,\n" +
-                "   t.ts,\n" +
-                "   t.rolling60minTop10Weight,\n" +
-                "   t.rollingXMinMarketValue\n" +
-                "FROM top_10_weights t";
+        String rolling60MinMarketValueTable = "" +
+                "CREATE TABLE rolling_60_min_market_value_print (\n" +
+                "   accountId INT,\n" +
+                "   ts TIMESTAMP,\n" +
+                "   rolling60MinMarketValue DOUBLE\n" +
+                ") WITH ('connector' = 'print')";
 
         tableEnv.executeSql(createStockHoldingTableSql).await();
         tableEnv.executeSql(createPriceTableSql).await();
         tableEnv.executeSql(createTradeTableSql).await();
-        tableEnv.executeSql(printTableSql).await();
+        tableEnv.executeSql(rolling60MinTop10WeightPrintTable).await();
+        tableEnv.executeSql(rolling60MinMarketValueTable).await();
 
         tableEnv.executeSql(currentHoldingSql).await();
         tableEnv.executeSql(currentHoldingValueSql).await();
         tableEnv.executeSql(minuteSnapshotValueSql).await();
+        tableEnv.executeSql(top10MinuteSnapshotSql).await();
+        tableEnv.executeSql(marketValueSql).await();
         tableEnv.executeSql(top10WeightSql).await();
+        tableEnv.executeSql(rolling60MinTop10WeightSql).await();
+        tableEnv.executeSql(rolling60MinMarketValueSql).await();
 
-        tableEnv.executeSql(executeSql);
+        StatementSet statementSet = tableEnv.createStatementSet();
+        statementSet.addInsertSql("" +
+                "INSERT INTO rolling_60_min_top_10_weight_print\n" +
+                "SELECT\n" +
+                "   accountId,\n" +
+                "   ts,\n" +
+                "   rolling60MinTop10Weight\n" +
+                "FROM rolling_60_min_top_10_weight\n");
+
+        statementSet.addInsertSql("" +
+                "INSERT INTO rolling_60_min_market_value_print\n" +
+                "SELECT\n" +
+                "   accountId,\n" +
+                "   ts,\n" +
+                "   rolling60MinMarketValue\n" +
+                "FROM rolling_60_min_market_value");
+
+        String executeSql = "" +
+                "INSERT INTO rolling_60_min_top_10_weight_print\n" +
+                "SELECT\n" +
+                "   accountId,\n" +
+                "   ts,\n" +
+                "   rolling60MinTop10Weight\n" +
+                "FROM rolling_60_min_top_10_weight;\n" +
+                "\n" +
+                "INSERT INTO rolling_60_min_market_value_print\n" +
+                "SELECT\n" +
+                "   accountId,\n" +
+                "   ts,\n" +
+                "   rolling60MinMarketValue\n" +
+                "FROM rolling_60_min_market_value";
+        statementSet.execute();
+        env.execute();
     }
 
     public static Path saveResourceToTmpDir(String resourceFile, String partition) throws IOException {
